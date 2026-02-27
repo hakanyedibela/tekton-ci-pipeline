@@ -1,0 +1,138 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: git-clone
+  labels:
+    app.kubernetes.io/version: "0.9"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.50.0"
+    tekton.dev/categories: Git
+    tekton.dev/tags: git
+    tekton.dev/displayName: "Git Clone"
+    tekton.dev/description: |
+      Clones a git repository into the output workspace.
+      Supports SSH and HTTPS authentication.
+spec:
+  description: |
+    Clones a Git repository into a Workspace. Supports branch, tag, and commit SHA checkout.
+    Outputs the commit SHA as a result for downstream tasks.
+
+  workspaces:
+    - name: output
+      description: The git repo will be cloned onto the volume backing this Workspace.
+    - name: ssh-directory
+      optional: true
+      description: |
+        A .ssh directory with private key, known_hosts, config, etc.
+        Mounted at /root/.ssh for SSH-based clone.
+    - name: basic-auth
+      optional: true
+      description: |
+        A Workspace containing a .gitconfig and .git-credentials file for
+        basic-auth (username/password or token) clone.
+
+  params:
+    - name: url
+      description: Repository URL to clone from.
+      type: string
+    - name: revision
+      description: Revision to checkout. (branch, tag, sha, ref, etc...)
+      type: string
+      default: "main"
+    - name: depth
+      description: Perform a shallow clone, fetching only the most recent N commits.
+      type: string
+      default: "1"
+    - name: deleteExisting
+      description: Clean out the contents of the destination directory before cloning.
+      type: string
+      default: "true"
+    - name: submodules
+      description: Initialize and fetch git submodules.
+      type: string
+      default: "true"
+
+  results:
+    - name: commit
+      description: The precise commit SHA that was fetched.
+    - name: url
+      description: The precise URL that was fetched.
+    - name: committer-date
+      description: The epoch timestamp of the commit that was fetched.
+
+  steps:
+    - name: clone
+      image: cgr.dev/chainguard/git:root-2.39
+      env:
+        - name: HOME
+          value: /root
+        - name: PARAM_URL
+          value: $(params.url)
+        - name: PARAM_REVISION
+          value: $(params.revision)
+        - name: PARAM_DEPTH
+          value: $(params.depth)
+        - name: PARAM_DELETE_EXISTING
+          value: $(params.deleteExisting)
+        - name: PARAM_SUBMODULES
+          value: $(params.submodules)
+        - name: WORKSPACE_OUTPUT_PATH
+          value: $(workspaces.output.path)
+        - name: WORKSPACE_SSH_DIRECTORY_BOUND
+          value: $(workspaces.ssh-directory.bound)
+        - name: WORKSPACE_SSH_DIRECTORY_PATH
+          value: $(workspaces.ssh-directory.path)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
+          value: $(workspaces.basic-auth.bound)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
+          value: $(workspaces.basic-auth.path)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        # Configure SSH if workspace is bound
+        if [ "${WORKSPACE_SSH_DIRECTORY_BOUND}" = "true" ]; then
+          cp -R "${WORKSPACE_SSH_DIRECTORY_PATH}" /root/.ssh
+          chmod 700 /root/.ssh
+          chmod -R 400 /root/.ssh/*
+        fi
+
+        # Configure basic auth if workspace is bound
+        if [ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" = "true" ]; then
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.gitconfig" /root/.gitconfig
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" /root/.git-credentials
+          chmod 400 /root/.git-credentials
+        fi
+
+        # Clean destination directory if requested
+        if [ "${PARAM_DELETE_EXISTING}" = "true" ]; then
+          if [ -d "${WORKSPACE_OUTPUT_PATH}/.git" ]; then
+            rm -rf "${WORKSPACE_OUTPUT_PATH}/.git"
+          fi
+        fi
+
+        # Clone the repository
+        git clone \
+          --depth "${PARAM_DEPTH}" \
+          --branch "${PARAM_REVISION}" \
+          "${PARAM_URL}" \
+          "${WORKSPACE_OUTPUT_PATH}" || \
+        git clone \
+          --depth "${PARAM_DEPTH}" \
+          "${PARAM_URL}" \
+          "${WORKSPACE_OUTPUT_PATH}"
+
+        cd "${WORKSPACE_OUTPUT_PATH}"
+
+        # Initialize submodules if requested
+        if [ "${PARAM_SUBMODULES}" = "true" ]; then
+          git submodule update --init --recursive
+        fi
+
+        # Capture results
+        COMMIT_SHA=$(git rev-parse HEAD)
+        echo -n "${COMMIT_SHA}" > $(results.commit.path)
+        echo -n "${PARAM_URL}" > $(results.url.path)
+        git log -1 --format=%ct > $(results.committer-date.path)
+
+        echo "Successfully cloned ${PARAM_URL} @ ${COMMIT_SHA}"

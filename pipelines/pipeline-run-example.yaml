@@ -1,0 +1,90 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: java-microservice-run-001
+  labels:
+    app.kubernetes.io/name: my-service
+    app.kubernetes.io/managed-by: tekton
+    # These labels are useful for querying related resources:
+    # kubectl get all -l tekton.dev/pipelineRun=java-microservice-run-001
+spec:
+  pipelineRef:
+    name: java-microservice-ci-cd
+
+  # ============================================================
+  # PARAMS — pipeline input values
+  # ============================================================
+  params:
+    - name: git-url
+      value: "https://github.com/myorg/my-service.git"
+    - name: git-revision
+      value: "main"
+    - name: image-registry
+      value: "harbor.example.com/myteam"
+    - name: image-name
+      value: "my-service"
+    - name: gitops-repo-url
+      value: "https://github.com/myorg/gitops-repo.git"
+    - name: gitops-values-path
+      value: "apps/my-service/values.yaml"
+
+  # ============================================================
+  # WORKSPACES — bind pipeline workspaces to actual volumes
+  # ============================================================
+  workspaces:
+
+    # Source code workspace — fresh PVC per run (recommended)
+    # Automatically provisioned and deleted with this PipelineRun
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 2Gi
+          storageClassName: fast-ssd  # Use your cluster's fast storage class
+
+    # Maven dependency cache — persistent PVC reused across runs
+    # Create this PVC once: kubectl apply -f workspaces/maven-cache-pvc.yaml
+    - name: maven-cache
+      persistentVolumeClaim:
+        claimName: maven-cache-pvc
+
+    # Docker registry credentials — from Secret
+    # Create this Secret: kubectl create secret docker-registry ...
+    - name: docker-credentials
+      secret:
+        secretName: harbor-registry-secret
+
+    # GitOps repo credentials — from Secret
+    - name: gitops-credentials
+      secret:
+        secretName: gitops-git-credentials
+
+  # ============================================================
+  # TIMEOUT — global timeout for the entire pipeline
+  # ============================================================
+  timeouts:
+    pipeline: "1h"
+    tasks: "45m"
+    finally: "10m"
+
+  # ============================================================
+  # SERVICE ACCOUNT — RBAC for the pipeline
+  # ============================================================
+  taskRunTemplate:
+    serviceAccountName: tekton-pipeline-sa
+    podTemplate:
+      # Run pipeline pods on dedicated CI nodes
+      nodeSelector:
+        node-role: ci
+      tolerations:
+        - key: "ci-only"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      # Security context for all task pods
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault

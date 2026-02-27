@@ -1,0 +1,94 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: java-microservice-pr-ci
+  labels:
+    app.kubernetes.io/name: tekton-ci-pipeline
+    app.kubernetes.io/version: "1.0"
+  annotations:
+    tekton.dev/displayName: "Java Microservice PR CI Pipeline"
+    tekton.dev/description: |
+      Lightweight CI pipeline for pull requests:
+        1. Clone source repository at PR head commit
+        2. Run Maven build and unit tests
+        3. Scan source filesystem with Trivy (no image build/push)
+      No image publish, no GitOps update, no Slack notification.
+spec:
+  params:
+    - name: git-url
+      type: string
+      description: Source repository URL.
+    - name: git-revision
+      type: string
+      description: PR head commit SHA.
+    - name: pr-number
+      type: string
+      description: GitHub pull request number (informational label).
+    - name: maven-goals
+      type: array
+      description: Maven goals to run.
+      default:
+        - "clean"
+        - "verify"
+        - "-Dmaven.test.failure.ignore=false"
+
+  workspaces:
+    - name: source
+      description: Ephemeral workspace for source code (volumeClaimTemplate per run).
+    - name: maven-cache
+      description: Persistent Maven local repository cache.
+      optional: true
+
+  results:
+    - name: commit-sha
+      description: The PR head commit SHA that was built.
+      value: $(tasks.clone-repo.results.commit)
+
+  tasks:
+    - name: clone-repo
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: depth
+          value: "1"
+
+    - name: maven-build
+      taskRef:
+        name: maven-build
+      runAfter:
+        - clone-repo
+      workspaces:
+        - name: source
+          workspace: source
+        - name: maven-local-repo
+          workspace: maven-cache
+      params:
+        - name: GOALS
+          value: $(params.maven-goals[*])
+        - name: MAVEN_OPTS
+          value: "-B -e"
+
+    - name: trivy-scan
+      taskRef:
+        name: trivy-scan
+      runAfter:
+        - maven-build
+      workspaces:
+        - name: source
+          workspace: source
+      params:
+        - name: SCAN_TYPE
+          value: "filesystem"
+        - name: SCAN_TARGET
+          value: "."
+        - name: SEVERITY
+          value: "HIGH,CRITICAL"
+        - name: IGNORE_UNFIXED
+          value: "true"

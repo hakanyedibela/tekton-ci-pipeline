@@ -1,0 +1,244 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: java-microservice-ci-cd
+  labels:
+    app.kubernetes.io/name: tekton-ci-pipeline
+    app.kubernetes.io/version: "1.0"
+  annotations:
+    tekton.dev/displayName: "Java Microservice CI/CD Pipeline"
+    tekton.dev/description: |
+      Full CI/CD pipeline for Java microservices:
+        1. Clone source repository
+        2. Run unit tests and Maven build (parallel linting)
+        3. Build Docker image with Kaniko (no privileged mode)
+        4. Scan image for vulnerabilities with Trivy
+        5. Push and sign image (Tekton Chains)
+        6. Update GitOps repository (triggers ArgoCD)
+      Finally: Send Slack notification (always runs)
+spec:
+  description: |
+    End-to-end CI/CD pipeline for Java Spring Boot microservices.
+    Uses Kaniko for container builds (no Docker socket), Trivy for security scanning,
+    and GitOps pattern for deployment via ArgoCD.
+
+  # ============================================================
+  # PARAMS — values passed in at PipelineRun time or from Trigger
+  # ============================================================
+  params:
+    - name: git-url
+      type: string
+      description: Source repository URL.
+    - name: git-revision
+      type: string
+      description: Git branch, tag, or commit SHA.
+      default: "main"
+    - name: image-registry
+      type: string
+      description: Container registry (e.g., harbor.example.com/myteam).
+    - name: image-name
+      type: string
+      description: Image name without registry prefix (e.g., my-service).
+    - name: gitops-repo-url
+      type: string
+      description: GitOps repository URL for ArgoCD.
+    - name: gitops-values-path
+      type: string
+      description: Path to values.yaml in GitOps repo.
+      default: "apps/$(params.image-name)/values.yaml"
+    - name: deploy-to-prod
+      type: string
+      description: Set to "true" to trigger production deployment.
+      default: "false"
+    - name: maven-goals
+      type: array
+      description: Maven goals to run.
+      default:
+        - "clean"
+        - "verify"
+        - "-Dmaven.test.failure.ignore=false"
+
+  # ============================================================
+  # WORKSPACES — storage shared between tasks
+  # ============================================================
+  workspaces:
+    - name: source
+      description: |
+        Shared PVC workspace for source code.
+        Cloned in clone-repo, used in build, test, and scan tasks.
+    - name: maven-cache
+      description: |
+        Persistent Maven local repository cache.
+        Reused across pipeline runs to speed up builds.
+      optional: true
+    - name: docker-credentials
+      description: |
+        Secret workspace containing docker config.json for registry auth.
+    - name: gitops-credentials
+      description: |
+        Secret workspace with git credentials for GitOps repo updates.
+    - name: maven-settings
+      description: ConfigMap workspace with custom Maven settings.xml.
+      optional: true
+
+  # ============================================================
+  # RESULTS — outputs from the pipeline
+  # ============================================================
+  results:
+    - name: commit-sha
+      description: The git commit SHA that was built.
+      value: $(tasks.clone-repo.results.commit)
+    - name: image-url
+      description: The full image URL that was built and pushed.
+      value: $(tasks.build-image.results.IMAGE_URL)
+    - name: image-digest
+      description: The image digest for supply chain verification.
+      value: $(tasks.build-image.results.IMAGE_DIGEST)
+
+  # ============================================================
+  # TASKS — the pipeline DAG
+  # ============================================================
+  tasks:
+
+    # ----------------------------------------------------------
+    # STAGE 1: Clone source repository
+    # ----------------------------------------------------------
+    - name: clone-repo
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: depth
+          value: "1"
+
+    # ----------------------------------------------------------
+    # STAGE 2a: Maven build + test
+    # Runs AFTER clone-repo
+    # ----------------------------------------------------------
+    - name: maven-build
+      taskRef:
+        name: maven-build
+      runAfter:
+        - clone-repo
+      workspaces:
+        - name: source
+          workspace: source
+        - name: maven-local-repo
+          workspace: maven-cache
+        - name: maven-settings
+          workspace: maven-settings
+      params:
+        - name: GOALS
+          value: $(params.maven-goals[*])
+        - name: MAVEN_OPTS
+          value: "-B -e"
+
+    # ----------------------------------------------------------
+    # STAGE 3: Build container image with Kaniko
+    # Runs AFTER maven-build
+    # Uses commit SHA for immutable image tagging
+    # ----------------------------------------------------------
+    - name: build-image
+      taskRef:
+        name: kaniko-build
+      runAfter:
+        - maven-build
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: docker-credentials
+      params:
+        - name: IMAGE
+          value: "$(params.image-registry)/$(params.image-name):$(tasks.clone-repo.results.commit)"
+        - name: DOCKERFILE
+          value: "./Dockerfile"
+        - name: EXTRA_ARGS
+          value:
+            - "--cache=true"
+            - "--cache-repo=$(params.image-registry)/cache/$(params.image-name)"
+            - "--build-arg=BUILD_DATE=$(tasks.clone-repo.results.committer-date)"
+            - "--build-arg=GIT_COMMIT=$(tasks.clone-repo.results.commit)"
+            - "--label=org.opencontainers.image.revision=$(tasks.clone-repo.results.commit)"
+            - "--label=org.opencontainers.image.source=$(params.git-url)"
+
+    # ----------------------------------------------------------
+    # STAGE 4: Vulnerability scan with Trivy
+    # Runs AFTER build-image
+    # Pipeline FAILS if HIGH/CRITICAL CVEs found
+    # ----------------------------------------------------------
+    - name: scan-image
+      taskRef:
+        name: trivy-scan
+      runAfter:
+        - build-image
+      workspaces:
+        - name: source
+          workspace: source
+      params:
+        - name: IMAGE
+          value: "$(params.image-registry)/$(params.image-name):$(tasks.clone-repo.results.commit)"
+        - name: SEVERITY
+          value: "HIGH,CRITICAL"
+        - name: IGNORE_UNFIXED
+          value: "true"
+
+    # ----------------------------------------------------------
+    # STAGE 5: Update GitOps repository
+    # Only runs if:
+    #   a) Scan passed (tasks.scan-image.results.SCAN_RESULT == "PASS")
+    #   b) Branch is main (production-like)
+    # ----------------------------------------------------------
+    - name: update-gitops
+      taskRef:
+        name: update-gitops-repo
+      runAfter:
+        - scan-image
+      when:
+        - input: "$(tasks.scan-image.results.SCAN_RESULT)"
+          operator: in
+          values: ["PASS"]
+        - input: "$(params.git-revision)"
+          operator: in
+          values: ["main", "master"]
+      workspaces:
+        - name: gitops-auth
+          workspace: gitops-credentials
+      params:
+        - name: GITOPS_REPO_URL
+          value: $(params.gitops-repo-url)
+        - name: IMAGE_TAG
+          value: $(tasks.clone-repo.results.commit)
+        - name: IMAGE_NAME
+          value: "$(params.image-registry)/$(params.image-name)"
+        - name: VALUES_FILE_PATH
+          value: $(params.gitops-values-path)
+        - name: YQ_IMAGE_PATH
+          value: ".image.tag"
+
+  # ============================================================
+  # FINALLY — runs regardless of pipeline success or failure
+  # Used for: notifications, cleanup, audit
+  # ============================================================
+  finally:
+
+    - name: notify-slack
+      taskRef:
+        name: slack-notify
+      params:
+        - name: PIPELINE_RUN_NAME
+          value: $(context.pipelineRun.name)
+        - name: PIPELINE_STATUS
+          value: $(tasks.status)
+        - name: IMAGE_URL
+          value: "$(params.image-registry)/$(params.image-name):$(tasks.clone-repo.results.commit)"
+        - name: GIT_COMMIT
+          value: $(tasks.clone-repo.results.commit)
+        - name: GIT_REPO_URL
+          value: $(params.git-url)

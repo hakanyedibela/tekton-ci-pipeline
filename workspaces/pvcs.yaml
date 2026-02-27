@@ -1,0 +1,53 @@
+---
+# Maven dependency cache PVC
+# Persistent across pipeline runs — speeds up builds significantly
+# Create once per namespace, reused by all pipeline runs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: maven-cache-pvc
+  labels:
+    app.kubernetes.io/name: tekton-ci-pipeline
+    purpose: build-cache
+  annotations:
+    # Describe the retention policy in annotations for operators
+    tekton.dev/description: "Maven local repository cache. Retained across pipeline runs."
+spec:
+  accessModes:
+    - ReadWriteOnce  # Can be mounted by one node at a time
+  resources:
+    requests:
+      storage: 5Gi   # Maven repos can be large; adjust per project
+  storageClassName: standard
+
+---
+# Example: Gradle cache PVC (for Gradle-based projects)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gradle-cache-pvc
+  labels:
+    app.kubernetes.io/name: tekton-ci-pipeline
+    purpose: build-cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+
+---
+# Shared pipeline workspace PVC (for multi-pod pipelines on same node)
+# Use ReadWriteMany if Tasks run on different nodes simultaneously
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: shared-source-pvc
+# spec:
+#   accessModes:
+#     - ReadWriteMany  # NFS, EFS, Rook-Ceph CephFS, etc.
+#   resources:
+#     requests:
+#       storage: 2Gi
+#   storageClassName: nfs-client

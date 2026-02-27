@@ -1,0 +1,54 @@
+---
+# Tekton Chains Configuration
+# Tekton Chains automatically signs TaskRun results and generates SLSA provenance
+# Install: kubectl apply --filename https://storage.googleapis.com/tekton-releases/chains/latest/release.yaml
+
+# ConfigMap for Tekton Chains configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chains-config
+  namespace: tekton-chains
+data:
+  # What artifacts to sign
+  # "taskrun" = sign all TaskRuns (results, params)
+  # "oci" = sign container images (requires IMAGE_URL and IMAGE_DIGEST results)
+  artifacts.taskrun.format: "slsa/v1"
+  artifacts.taskrun.storage: "tekton"
+  artifacts.oci.format: "simplesigning"
+  artifacts.oci.storage: "oci"
+
+  # Transparency log — submit to Rekor (Sigstore)
+  transparency.enabled: "true"
+  transparency.url: "https://rekor.sigstore.dev"
+
+  # Signing backend — supported: x509, kms, cosign
+  signers.x509.fulcio.address: "https://fulcio.sigstore.dev"
+  signers.x509.fulcio.oidc.issuer: "https://oauth2.sigstore.dev/auth"
+  signers.x509.tuf.mirror.url: "https://tuf.sigstore.dev"
+
+---
+# To use cosign for signing, create a signing secret:
+# cosign generate-key-pair k8s://tekton-chains/signing-secrets
+#
+# This creates:
+# - Secret "signing-secrets" with cosign.key and cosign.pub
+# - Used by Tekton Chains to sign all artifacts
+
+---
+# Example: How Tekton Chains works with your pipeline
+# When your kaniko-build Task completes with results:
+#   - IMAGE_URL: harbor.example.com/myteam/my-service:abc1234
+#   - IMAGE_DIGEST: sha256:deadbeef...
+#
+# Tekton Chains automatically:
+# 1. Reads those results from the TaskRun
+# 2. Signs the image with cosign
+# 3. Pushes signature to the registry (harbor.example.com/myteam/my-service:sha256-deadbeef.sig)
+# 4. Generates SLSA provenance
+# 5. Submits to Rekor transparency log
+#
+# Verify the signature later:
+# cosign verify harbor.example.com/myteam/my-service:abc1234 \
+#   --certificate-identity=tekton@example.com \
+#   --certificate-oidc-issuer=https://accounts.google.com

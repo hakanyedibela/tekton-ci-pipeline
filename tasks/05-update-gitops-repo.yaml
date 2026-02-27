@@ -1,0 +1,140 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: update-gitops-repo
+  labels:
+    app.kubernetes.io/version: "0.3"
+  annotations:
+    tekton.dev/categories: GitOps
+    tekton.dev/tags: gitops, git, deployment, argocd
+    tekton.dev/displayName: "Update GitOps Repository"
+    tekton.dev/description: |
+      Updates the image tag in a GitOps repository to trigger ArgoCD deployment.
+      Commits and pushes the change to the GitOps repo.
+spec:
+  description: |
+    Clones a GitOps repository, updates the image tag using yq,
+    commits the change, and pushes it back. This triggers ArgoCD to detect
+    the change and sync the new image to the cluster.
+
+  workspaces:
+    - name: gitops-auth
+      description: |
+        A workspace containing git credentials (.gitconfig and .git-credentials)
+        or SSH key for authenticating with the GitOps repository.
+
+  params:
+    - name: GITOPS_REPO_URL
+      description: URL of the GitOps repository.
+      type: string
+    - name: GITOPS_REPO_BRANCH
+      description: Branch in the GitOps repo to update.
+      type: string
+      default: "main"
+    - name: IMAGE_TAG
+      description: The new image tag to set.
+      type: string
+    - name: IMAGE_NAME
+      description: The image name (without tag).
+      type: string
+    - name: VALUES_FILE_PATH
+      description: Path to the values file within the GitOps repo (e.g., apps/myapp/values.yaml).
+      type: string
+    - name: YQ_IMAGE_PATH
+      description: yq expression path for the image tag (e.g., .image.tag).
+      type: string
+      default: ".image.tag"
+    - name: GIT_USER_EMAIL
+      description: Git commit author email.
+      type: string
+      default: "tekton-ci@example.com"
+    - name: GIT_USER_NAME
+      description: Git commit author name.
+      type: string
+      default: "Tekton CI"
+
+  results:
+    - name: GITOPS_COMMIT_SHA
+      description: The commit SHA of the GitOps update.
+
+  steps:
+    - name: clone-gitops-repo
+      image: alpine/git:2.40.1
+      env:
+        - name: HOME
+          value: /root
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Setup git credentials
+        if [ -f "$(workspaces.gitops-auth.path)/.gitconfig" ]; then
+          cp $(workspaces.gitops-auth.path)/.gitconfig /root/.gitconfig
+        fi
+        if [ -f "$(workspaces.gitops-auth.path)/.git-credentials" ]; then
+          cp $(workspaces.gitops-auth.path)/.git-credentials /root/.git-credentials
+          chmod 400 /root/.git-credentials
+        fi
+
+        git clone \
+          --branch $(params.GITOPS_REPO_BRANCH) \
+          --depth 1 \
+          $(params.GITOPS_REPO_URL) \
+          /workspace/gitops
+
+    - name: update-image-tag
+      image: mikefarah/yq:4.40.5
+      script: |
+        #!/bin/sh
+        set -eu
+
+        cd /workspace/gitops
+
+        echo "Updating image tag in $(params.VALUES_FILE_PATH)"
+        echo "New image: $(params.IMAGE_NAME):$(params.IMAGE_TAG)"
+
+        yq e '$(params.YQ_IMAGE_PATH) = "$(params.IMAGE_TAG)"' \
+          -i $(params.VALUES_FILE_PATH)
+
+        echo "--- Updated file ---"
+        cat $(params.VALUES_FILE_PATH)
+
+    - name: commit-and-push
+      image: alpine/git:2.40.1
+      env:
+        - name: HOME
+          value: /root
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Restore credentials
+        if [ -f "$(workspaces.gitops-auth.path)/.gitconfig" ]; then
+          cp $(workspaces.gitops-auth.path)/.gitconfig /root/.gitconfig
+        fi
+        if [ -f "$(workspaces.gitops-auth.path)/.git-credentials" ]; then
+          cp $(workspaces.gitops-auth.path)/.git-credentials /root/.git-credentials
+          chmod 400 /root/.git-credentials
+        fi
+
+        cd /workspace/gitops
+
+        git config user.email "$(params.GIT_USER_EMAIL)"
+        git config user.name "$(params.GIT_USER_NAME)"
+
+        git add $(params.VALUES_FILE_PATH)
+
+        # Only commit if there are changes
+        if git diff --staged --quiet; then
+          echo "No changes to commit — image tag already up to date"
+          git rev-parse HEAD > $(results.GITOPS_COMMIT_SHA.path)
+        else
+          git commit -m "ci: update $(params.IMAGE_NAME) image tag to $(params.IMAGE_TAG)
+
+Automated update by Tekton CI pipeline.
+Image: $(params.IMAGE_NAME):$(params.IMAGE_TAG)"
+
+          git push origin $(params.GITOPS_REPO_BRANCH)
+          git rev-parse HEAD > $(results.GITOPS_COMMIT_SHA.path)
+          echo "Successfully updated GitOps repo"
+        fi

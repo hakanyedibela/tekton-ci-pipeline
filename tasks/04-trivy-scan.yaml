@@ -1,0 +1,108 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: trivy-scan
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/categories: Security
+    tekton.dev/tags: vulnerability-scan, trivy, security
+    tekton.dev/displayName: "Trivy Vulnerability Scanner"
+    tekton.dev/description: |
+      Scans a container image for vulnerabilities using Trivy.
+      Can be configured to fail on specific severity levels.
+spec:
+  description: |
+    Scans a container image for CVEs using Aqua Security Trivy.
+    Supports configurable severity thresholds and output formats.
+    Integrates with OCI registries for image scanning.
+
+  workspaces:
+    - name: source
+      optional: true
+      description: Workspace for scanning filesystem or IaC configurations.
+
+  params:
+    - name: IMAGE
+      description: Full image reference to scan (e.g., registry.example.com/myapp:sha-abc123).
+      type: string
+    - name: SEVERITY
+      description: Severities to fail on. Comma-separated. (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)
+      type: string
+      default: "HIGH,CRITICAL"
+    - name: TRIVY_IMAGE
+      description: The Trivy scanner image.
+      type: string
+      default: "aquasec/trivy:0.50.0"
+    - name: IGNORE_UNFIXED
+      description: Ignore vulnerabilities that don't have a fix available.
+      type: string
+      default: "true"
+    - name: OUTPUT_FORMAT
+      description: Output format (table, json, sarif, template).
+      type: string
+      default: "table"
+    - name: SCAN_TYPE
+      description: Scan type (image, fs, config, repo).
+      type: string
+      default: "image"
+
+  results:
+    - name: SCAN_RESULT
+      description: Overall scan result (PASS or FAIL).
+
+  steps:
+    - name: scan
+      image: $(params.TRIVY_IMAGE)
+      env:
+        - name: TRIVY_NO_PROGRESS
+          value: "true"
+        - name: TRIVY_TIMEOUT
+          value: "10m"
+      script: |
+        #!/bin/sh
+        set -e
+
+        echo "=== Trivy Vulnerability Scan ==="
+        echo "Image: $(params.IMAGE)"
+        echo "Severity threshold: $(params.SEVERITY)"
+        echo ""
+
+        # Run vulnerability scan
+        trivy image \
+          --severity $(params.SEVERITY) \
+          --format $(params.OUTPUT_FORMAT) \
+          --exit-code 1 \
+          $(if [ "$(params.IGNORE_UNFIXED)" = "true" ]; then echo "--ignore-unfixed"; fi) \
+          $(params.IMAGE) && SCAN_EXIT=0 || SCAN_EXIT=$?
+
+        if [ $SCAN_EXIT -eq 0 ]; then
+          echo "PASS" > $(results.SCAN_RESULT.path)
+          echo ""
+          echo "✓ Scan PASSED — no vulnerabilities above threshold"
+        else
+          echo "FAIL" > $(results.SCAN_RESULT.path)
+          echo ""
+          echo "✗ Scan FAILED — vulnerabilities found above threshold"
+          exit 1
+        fi
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "200m"
+        limits:
+          memory: "1Gi"
+          cpu: "1"
+
+    - name: scan-config
+      image: $(params.TRIVY_IMAGE)
+      script: |
+        #!/bin/sh
+        # Also scan for misconfigurations in source if workspace is bound
+        if [ -d "$(workspaces.source.path)" ]; then
+          echo "=== Trivy Misconfiguration Scan ==="
+          trivy config \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            $(workspaces.source.path) || true
+        fi

@@ -1,0 +1,72 @@
+# Tekton Pipelines as Code (PAC) — per-repository pipeline definition
+# This file lives in .tekton/ folder of the application repo
+# PAC automatically picks it up when a PR/push event occurs
+# Install PAC: https://pipelinesascode.com/
+
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pull-request-ci
+  annotations:
+    # PAC annotations — define when this PipelineRun triggers
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main, develop]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+    pipelinesascode.tekton.dev/task: "git-clone, maven-build, trivy-scan"
+spec:
+  pipelineSpec:
+    workspaces:
+      - name: source
+      - name: maven-cache
+
+    tasks:
+      - name: clone
+        taskRef:
+          name: git-clone
+        workspaces:
+          - name: output
+            workspace: source
+        params:
+          - name: url
+            value: "{{ repo_url }}"  # PAC variable
+          - name: revision
+            value: "{{ revision }}"  # PAC variable
+
+      - name: build-and-test
+        taskRef:
+          name: maven-build
+        runAfter: [clone]
+        workspaces:
+          - name: source
+            workspace: source
+          - name: maven-local-repo
+            workspace: maven-cache
+        params:
+          - name: GOALS
+            value:
+              - clean
+              - verify
+
+      - name: scan
+        taskRef:
+          name: trivy-scan
+        runAfter: [build-and-test]
+        params:
+          - name: IMAGE
+            value: "{{ repo_url }}:{{ revision }}"
+          - name: SCAN_TYPE
+            value: "fs"
+
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 1Gi
+
+    - name: maven-cache
+      persistentVolumeClaim:
+        claimName: maven-cache-pvc

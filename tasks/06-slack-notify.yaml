@@ -1,0 +1,101 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: slack-notify
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/categories: Notification
+    tekton.dev/tags: slack, notification
+    tekton.dev/displayName: "Slack Notification"
+    tekton.dev/description: |
+      Sends a Slack notification with pipeline status.
+      Used as a finally task to always report results.
+spec:
+  description: |
+    Sends a Slack notification via webhook.
+    Should be used as a 'finally' task so it always runs.
+
+  params:
+    - name: PIPELINE_RUN_NAME
+      description: The name of the PipelineRun.
+      type: string
+    - name: PIPELINE_STATUS
+      description: The overall pipeline status (Succeeded, Failed, etc.).
+      type: string
+    - name: IMAGE_URL
+      description: The built image URL.
+      type: string
+      default: ""
+    - name: GIT_COMMIT
+      description: The git commit SHA.
+      type: string
+      default: ""
+    - name: GIT_REPO_URL
+      description: The source git repository URL.
+      type: string
+      default: ""
+
+  steps:
+    - name: send-notification
+      image: curlimages/curl:8.5.0
+      env:
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: slack-webhook-secret
+              key: webhook-url
+        - name: PIPELINE_RUN_NAME
+          value: $(params.PIPELINE_RUN_NAME)
+        - name: PIPELINE_STATUS
+          value: $(params.PIPELINE_STATUS)
+        - name: IMAGE_URL
+          value: $(params.IMAGE_URL)
+        - name: GIT_COMMIT
+          value: $(params.GIT_COMMIT)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Determine emoji and color based on status
+        if [ "${PIPELINE_STATUS}" = "Succeeded" ]; then
+          EMOJI=":white_check_mark:"
+          COLOR="#36a64f"
+          STATUS_TEXT="succeeded"
+        else
+          EMOJI=":x:"
+          COLOR="#ff0000"
+          STATUS_TEXT="FAILED"
+        fi
+
+        SHORT_COMMIT=$(echo "${GIT_COMMIT}" | cut -c1-8)
+
+        curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"attachments\": [
+              {
+                \"color\": \"${COLOR}\",
+                \"blocks\": [
+                  {
+                    \"type\": \"header\",
+                    \"text\": {
+                      \"type\": \"plain_text\",
+                      \"text\": \"${EMOJI} Pipeline ${STATUS_TEXT}: ${PIPELINE_RUN_NAME}\"
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {\"type\": \"mrkdwn\", \"text\": \"*Status:*\n${PIPELINE_STATUS}\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*Commit:*\n\`${SHORT_COMMIT}\`\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*Image:*\n\`${IMAGE_URL}\`\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*Pipeline Run:*\n${PIPELINE_RUN_NAME}\"}
+                    ]
+                  }
+                ]
+              }
+            ]
+          }"
+
+        echo "Slack notification sent"

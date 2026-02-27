@@ -1,0 +1,100 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: maven-build
+  labels:
+    app.kubernetes.io/version: "1.0"
+  annotations:
+    tekton.dev/categories: Build
+    tekton.dev/tags: java, maven, build
+    tekton.dev/displayName: "Maven Build"
+    tekton.dev/description: |
+      Builds a Java/Maven project. Runs tests, compiles, and packages.
+      Uses a Maven cache workspace to speed up builds.
+spec:
+  description: |
+    Builds a Maven project. Supports custom Maven goals, settings, and
+    a persistent cache workspace for dependencies.
+
+  workspaces:
+    - name: source
+      description: The workspace containing the source code.
+    - name: maven-settings
+      optional: true
+      description: |
+        A Workspace containing a custom maven settings.xml file.
+        Will be mounted at /root/.m2/settings.xml
+    - name: maven-local-repo
+      optional: true
+      description: |
+        A Workspace to be used as the maven local repository cache.
+        Speeds up subsequent builds by caching downloaded artifacts.
+
+  params:
+    - name: MAVEN_IMAGE
+      description: The Maven image to use.
+      type: string
+      default: "maven:3.9-eclipse-temurin-21"
+    - name: GOALS
+      description: The Maven goals to run.
+      type: array
+      default:
+        - "clean"
+        - "package"
+    - name: CONTEXT_DIR
+      description: The directory containing the pom.xml file.
+      type: string
+      default: "."
+    - name: MAVEN_OPTS
+      description: Additional Maven options (e.g., -DskipTests).
+      type: string
+      default: ""
+
+  results:
+    - name: artifact-version
+      description: The version from pom.xml.
+    - name: artifact-id
+      description: The artifact ID from pom.xml.
+
+  steps:
+    - name: mvn-goals
+      image: $(params.MAVEN_IMAGE)
+      workingDir: $(workspaces.source.path)/$(params.CONTEXT_DIR)
+      env:
+        - name: HOME
+          value: /root
+      command:
+        - mvn
+      args:
+        - $(params.GOALS[*])
+        - $(params.MAVEN_OPTS)
+        - -Dmaven.repo.local=$(workspaces.maven-local-repo.path)
+      volumeMounts:
+        - name: m2-settings
+          mountPath: /root/.m2/settings.xml
+          subPath: settings.xml
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "2Gi"
+          cpu: "2"
+
+    - name: extract-version
+      image: alpine:3.19
+      workingDir: $(workspaces.source.path)/$(params.CONTEXT_DIR)
+      script: |
+        #!/bin/sh
+        apk add --no-cache libxml2-utils > /dev/null 2>&1
+        VERSION=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='version']/text()" pom.xml 2>/dev/null || echo "unknown")
+        ARTIFACT=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='artifactId']/text()" pom.xml 2>/dev/null || echo "unknown")
+        echo -n "${VERSION}" > $(results.artifact-version.path)
+        echo -n "${ARTIFACT}" > $(results.artifact-id.path)
+        echo "Artifact: ${ARTIFACT}:${VERSION}"
+
+  volumes:
+    - name: m2-settings
+      configMap:
+        name: maven-settings
+        optional: true

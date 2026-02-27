@@ -1,0 +1,94 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: kaniko-build
+  labels:
+    app.kubernetes.io/version: "0.6"
+  annotations:
+    tekton.dev/categories: Image Build
+    tekton.dev/tags: image-build, kaniko, docker
+    tekton.dev/displayName: "Kaniko Build"
+    tekton.dev/description: |
+      Builds a container image using Kaniko — without requiring Docker daemon
+      or privileged containers. Pushes to any OCI-compatible registry.
+spec:
+  description: |
+    Builds and pushes a Docker image using Kaniko.
+    Kaniko runs as a non-privileged container, making it safe for Kubernetes CI.
+    Supports multi-platform builds and build cache.
+
+  workspaces:
+    - name: source
+      description: The workspace holding the source code and Dockerfile.
+    - name: dockerconfig
+      description: |
+        A Workspace containing a docker config.json for registry authentication.
+        Mount a Secret with .dockerconfigjson data as this workspace.
+      mountPath: /kaniko/.docker
+
+  params:
+    - name: IMAGE
+      description: Full name of the image to build and push (e.g., registry.example.com/myapp:latest).
+      type: string
+    - name: DOCKERFILE
+      description: Path to the Dockerfile relative to the source workspace.
+      type: string
+      default: "./Dockerfile"
+    - name: CONTEXT
+      description: Build context relative to the source workspace.
+      type: string
+      default: "."
+    - name: BUILDER_IMAGE
+      description: The Kaniko executor image.
+      type: string
+      default: "gcr.io/kaniko-project/executor:v1.21.0"
+    - name: EXTRA_ARGS
+      description: Additional args for kaniko executor (e.g., --cache=true --cache-repo=...).
+      type: array
+      default: []
+    - name: SKIP_PUSH
+      description: Set to true to build without pushing (useful for testing).
+      type: string
+      default: "false"
+
+  results:
+    - name: IMAGE_DIGEST
+      description: Digest of the image just built.
+    - name: IMAGE_URL
+      description: URL of the image just built.
+
+  steps:
+    - name: build-and-push
+      image: $(params.BUILDER_IMAGE)
+      args:
+        - --dockerfile=$(params.DOCKERFILE)
+        - --context=$(workspaces.source.path)/$(params.CONTEXT)
+        - --destination=$(params.IMAGE)
+        - --digest-file=$(results.IMAGE_DIGEST.path)
+        - --skip-push=$(params.SKIP_PUSH)
+        - --cache=true
+        - --cache-ttl=24h
+        - --snapshot-mode=redo
+        - --use-new-run
+        - $(params.EXTRA_ARGS[*])
+      securityContext:
+        runAsUser: 0
+        # Note: Kaniko does NOT need privileged: true
+        # This is the key advantage over Docker-in-Docker
+      env:
+        - name: DOCKER_CONFIG
+          value: /kaniko/.docker
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "2Gi"
+          cpu: "2"
+
+    - name: write-url
+      image: busybox:1.35
+      script: |
+        echo -n "$(params.IMAGE)" > $(results.IMAGE_URL.path)
+        echo "Image pushed: $(params.IMAGE)"
+        echo "Digest: $(cat $(results.IMAGE_DIGEST.path))"

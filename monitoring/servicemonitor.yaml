@@ -1,0 +1,107 @@
+---
+# Prometheus ServiceMonitor for Tekton Pipelines controller metrics
+# Requires: Prometheus Operator (kube-prometheus-stack)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-pipelines-controller
+  namespace: monitoring
+  labels:
+    app: tekton-pipelines-controller
+    release: prometheus  # Must match Prometheus Operator's serviceMonitorSelector
+spec:
+  namespaceSelector:
+    matchNames:
+      - tekton-pipelines
+  selector:
+    matchLabels:
+      app: tekton-pipelines-controller
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      path: /metrics
+
+---
+# ServiceMonitor for Tekton Triggers
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-triggers-controller
+  namespace: monitoring
+  labels:
+    app: tekton-triggers-controller
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - tekton-pipelines
+  selector:
+    matchLabels:
+      app: tekton-triggers-controller
+  endpoints:
+    - port: metrics
+      interval: 30s
+
+---
+# PrometheusRule — alerting rules for Tekton
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tekton-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: tekton.pipeline.rules
+      interval: 30s
+      rules:
+
+        # Alert when pipeline failure rate exceeds 10%
+        - alert: TektonHighPipelineFailureRate
+          expr: |
+            (
+              rate(tekton_pipelines_controller_pipelinerun_count{status="failed"}[15m])
+              /
+              rate(tekton_pipelines_controller_pipelinerun_count[15m])
+            ) > 0.10
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "High Tekton pipeline failure rate"
+            description: "More than 10% of pipeline runs are failing over the last 15 minutes. Current rate: {{ $value | humanizePercentage }}"
+            runbook_url: "https://wiki.example.com/runbooks/tekton-high-failure-rate"
+
+        # Alert when pipelines take too long
+        - alert: TektonPipelineLongRunning
+          expr: |
+            tekton_pipelines_controller_running_pipelineruns > 0
+            and on()
+            (time() - tekton_pipelines_controller_pipelinerun_duration_seconds_sum
+              / tekton_pipelines_controller_pipelinerun_duration_seconds_count) > 3600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Tekton pipeline running longer than expected"
+            description: "A pipeline has been running for over 1 hour."
+
+        # Alert when controller queue is backing up
+        - alert: TektonControllerQueueDepthHigh
+          expr: workqueue_depth{name=~"tekton.*"} > 100
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Tekton controller work queue depth is high"
+            description: "The Tekton controller work queue has {{ $value }} items. Controller may be overloaded."
+
+        # Record rule: Pipeline success rate (useful for dashboards)
+        - record: tekton:pipelinerun:success_rate_5m
+          expr: |
+            rate(tekton_pipelines_controller_pipelinerun_count{status="succeeded"}[5m])
+            /
+            rate(tekton_pipelines_controller_pipelinerun_count[5m])
